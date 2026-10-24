@@ -1217,8 +1217,11 @@ static int fuse4fs_inum_access(struct fuse4fs *ff, const struct fuse_ctx *ctxt,
 		return -EACCES;
 	}
 
-	/* Remove the O_APPEND flag before testing permissions */
-	mask &= ~A_OK;
+	/*
+	 * Remove the O_APPEND and linked-file flags before testing permissions:
+	 * they are not mode bits, and L_OK (32) lands on the group read bit.
+	 */
+	mask &= ~(A_OK | L_OK);
 
 	/* allow owner, if perms match */
 	if (inode_uid(inode) == ctxt->uid) {
