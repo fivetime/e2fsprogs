@@ -260,6 +260,7 @@ struct fuse4fs {
 	int norecovery;
 	int kernel;
 	int directio;
+	int noexcl;
 	int acl;
 	int dirsync;
 
@@ -1351,9 +1352,16 @@ static errcode_t fuse4fs_open(struct fuse4fs *ff)
 {
 	char options[128];
 	double deadline;
-	int flags = EXT2_FLAG_64BITS | EXT2_FLAG_THREADS | EXT2_FLAG_RW |
-		    EXT2_FLAG_EXCLUSIVE;
+	int flags = EXT2_FLAG_64BITS | EXT2_FLAG_THREADS | EXT2_FLAG_RW;
 	errcode_t err;
+
+	/*
+	 * A fuseblk superblock that somebody else created for us (the
+	 * connection then arrives as /dev/fd/N) makes the kernel hold the
+	 * block device, so O_EXCL would fail with EBUSY; noexcl skips it.
+	 */
+	if (!ff->noexcl)
+		flags |= EXT2_FLAG_EXCLUSIVE;
 
 	if (ff->lockfile) {
 		err = fuse4fs_acquire_lockfile(ff);
@@ -1800,6 +1808,14 @@ static void op_init(void *userdata, struct fuse_conn_info *conn)
 #endif
 #ifdef FUSE_CAP_NO_EXPORT_SUPPORT
 	fuse_set_feature_flag(conn, FUSE_CAP_NO_EXPORT_SUPPORT);
+#endif
+#ifdef FUSE_CAP_ALLOW_IDMAP
+	/*
+	 * An idmapped mount needs the kernel to check permissions, which is
+	 * what kernel mode does, so that is when we can be idmapped.
+	 */
+	if (ff->kernel)
+		fuse_set_feature_flag(conn, FUSE_CAP_ALLOW_IDMAP);
 #endif
 	conn->time_gran = 1;
 
@@ -5841,6 +5857,7 @@ static struct fuse_opt fuse4fs_opts[] = {
 	FUSE4FS_OPT("oom_score_adj=%d",	oom_score_adj,		-500),
 	FUSE4FS_OPT("kernel",		kernel,			1),
 	FUSE4FS_OPT("directio",		directio,		1),
+	FUSE4FS_OPT("noexcl",		noexcl,			1),
 	FUSE4FS_OPT("acl",		acl,			1),
 	FUSE4FS_OPT("noacl",		acl,			0),
 	FUSE4FS_OPT("lockfile=%s",	lockfile,		0),
@@ -5929,6 +5946,8 @@ static int fuse4fs_opt_proc(void *data, const char *arg,
 	"    -o kernel              run this as if it were the kernel, which sets:\n"
 	"                           allow_others,default_permissions,suid,dev\n"
 	"    -o directio            use O_DIRECT to read and write the disk\n"
+	"    -o noexcl              do not open the disk O_EXCL, for a fuseblk\n"
+	"                           connection handed over as /dev/fd/N\n"
 	"    -o cache_size=N[KMG]   use a disk cache of this size\n"
 	"    -o errors=             behavior when an error is encountered:\n"
 	"                           continue|remount-ro|panic\n"
