@@ -44,6 +44,7 @@
 # undef _FILE_OFFSET_BITS
 #endif /* __SET_FOB_FOR_FUSE */
 #include <inttypes.h>
+#include <stdbool.h>
 #include "ext2fs/ext2fs.h"
 #include "ext2fs/ext2_fs.h"
 #include "ext2fs/ext2fsP.h"
