@@ -4030,8 +4030,13 @@ static void op_fsync(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
 	FUSE4FS_CHECK_HANDLE(req, fh);
 	dbg_printf(ff, "%s: ino=%d\n", __func__, fh->ino);
 	fs = fuse4fs_start(ff);
-	/* For now, flush everything, even if it's slow */
-	if (fuse4fs_is_writeable(ff) && fh->open_flags & EXT2_FILE_WRITE) {
+	/*
+	 * For now, flush everything, even if it's slow.  fsync on a read-only
+	 * descriptor must flush too: directories can only be opened
+	 * read-only, and fsyncing the parent directory is how a program makes
+	 * a rename or a new name durable.
+	 */
+	if (fuse4fs_is_writeable(ff)) {
 		err = ext2fs_flush2(fs, 0);
 		if (err)
 			ret = translate_error(fs, fh->ino, err);
