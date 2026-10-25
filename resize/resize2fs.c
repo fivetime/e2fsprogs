@@ -48,9 +48,7 @@ static errcode_t block_mover(ext2_resize_t rfs);
 static errcode_t inode_scan_and_fix(ext2_resize_t rfs);
 static errcode_t inode_ref_fix(ext2_resize_t rfs);
 static errcode_t move_itables(ext2_resize_t rfs);
-static errcode_t fix_resize_inode(ext2_filsys fs);
 static errcode_t fix_orphan_file_inode(ext2_filsys fs);
-static errcode_t resize2fs_calculate_summary_stats(ext2_filsys fs);
 static errcode_t fix_sb_journal_backup(ext2_filsys fs);
 static errcode_t clear_sparse_super2_last_group(ext2_resize_t rfs);
 static errcode_t reserve_sparse_super2_last_group(ext2_resize_t rfs,
@@ -2328,45 +2326,6 @@ static errcode_t reserve_sparse_super2_last_group(ext2_resize_t rfs,
 /*
  * Fix the resize inode
  */
-static errcode_t fix_resize_inode(ext2_filsys fs)
-{
-	struct ext2_inode	inode;
-	errcode_t		retval;
-
-	if (!ext2fs_has_feature_resize_inode(fs->super))
-		return 0;
-
-	retval = ext2fs_read_inode(fs, EXT2_RESIZE_INO, &inode);
-	if (retval) goto errout;
-
-	ext2fs_iblk_set(fs, &inode, 1);
-
-	retval = ext2fs_write_inode(fs, EXT2_RESIZE_INO, &inode);
-	if (retval) goto errout;
-
-	if (!inode.i_block[EXT2_DIND_BLOCK]) {
-		/*
-		 * Avoid zeroing out block #0; that's rude.  This
-		 * should never happen anyway since the filesystem
-		 * should be fsck'ed and we assume it is consistent.
-		 */
-		fprintf(stderr, "%s",
-			_("Should never happen: resize inode corrupt!\n"));
-		exit(1);
-	}
-
-	retval = ext2fs_zero_blocks2(fs, inode.i_block[EXT2_DIND_BLOCK], 1,
-				     NULL, NULL);
-	if (retval)
-		goto errout;
-
-	retval = ext2fs_create_resize_inode(fs);
-	if (retval)
-		goto errout;
-
-errout:
-	return retval;
-}
 
 struct process_orphan_block_data {
 	char 		*buf;
@@ -2440,87 +2399,6 @@ static errcode_t fix_orphan_file_inode(ext2_filsys fs)
 /*
  * Finally, recalculate the summary information
  */
-static errcode_t resize2fs_calculate_summary_stats(ext2_filsys fs)
-{
-	errcode_t	retval;
-	blk64_t		b, blk = fs->super->s_first_data_block;
-	ext2_ino_t	ino;
-	unsigned int	n, max, group, count;
-	blk64_t		total_clusters_free = 0;
-	int		total_inodes_free = 0;
-	int		group_free = 0;
-	int		uninit = 0;
-	char		*bitmap_buf;
-
-	/*
-	 * First calculate the block statistics
-	 */
-	bitmap_buf = malloc(fs->blocksize);
-	if (!bitmap_buf)
-		return ENOMEM;
-	for (group = 0; group < fs->group_desc_count; group++) {
-		retval = ext2fs_get_block_bitmap_range2(fs->block_map,
-			B2C(blk), fs->super->s_clusters_per_group, bitmap_buf);
-		if (retval) {
-			free(bitmap_buf);
-			return retval;
-		}
-		max = ext2fs_group_blocks_count(fs, group) >>
-		       fs->cluster_ratio_bits;
-		if ((group == fs->group_desc_count - 1) && (max & 7)) {
-			n = 0;
-			for (b = (fs->super->s_first_data_block +
-				  ((blk64_t) fs->super->s_blocks_per_group *
-				   group));
-			     b < ext2fs_blocks_count(fs->super);
-			     b += EXT2FS_CLUSTER_RATIO(fs)) {
-				if (ext2fs_test_block_bitmap2(fs->block_map, b))
-					n++;
-			}
-		} else {
-			n = ext2fs_bitcount(bitmap_buf, (max + 7) / 8);
-		}
-		group_free = max - n;
-		total_clusters_free += group_free;
-		ext2fs_bg_free_blocks_count_set(fs, group, group_free);
-		ext2fs_group_desc_csum_set(fs, group);
-		blk += fs->super->s_blocks_per_group;
-	}
-	free(bitmap_buf);
-	ext2fs_free_blocks_count_set(fs->super, C2B(total_clusters_free));
-
-	/*
-	 * Next, calculate the inode statistics
-	 */
-	group_free = 0;
-	count = 0;
-	group = 0;
-
-	/* Protect loop from wrap-around if s_inodes_count maxed */
-	uninit = ext2fs_bg_flags_test(fs, group, EXT2_BG_INODE_UNINIT);
-	for (ino = 1; ino <= fs->super->s_inodes_count && ino > 0; ino++) {
-		if (uninit ||
-		    !ext2fs_fast_test_inode_bitmap2(fs->inode_map, ino)) {
-			group_free++;
-			total_inodes_free++;
-		}
-		count++;
-		if ((count == fs->super->s_inodes_per_group) ||
-		    (ino == fs->super->s_inodes_count)) {
-			ext2fs_bg_free_inodes_count_set(fs, group, group_free);
-			ext2fs_group_desc_csum_set(fs, group);
-			group++;
-			if (group >= fs->group_desc_count)
-				break;
-			count = 0;
-			group_free = 0;
-			uninit = ext2fs_bg_flags_test(fs, group, EXT2_BG_INODE_UNINIT);
-		}
-	}
-	fs->super->s_free_inodes_count = total_inodes_free;
-	ext2fs_mark_super_dirty(fs);
-	return 0;
-}
 
 /*
  *  Journal may have been relocated; update the backup journal blocks
