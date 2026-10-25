@@ -1,0 +1,49 @@
+. $cmd_dir/fuse4fs_helpers
+OUT=$test_name.log
+rm -f $OUT $OUT.*
+reason=$(fuse4fs_skip_reason)
+if test -n "$reason"; then
+	echo "$test_name: $test_description: skipped ($reason)"
+	return 0
+fi
+
+MNT=$TMPFILE.mnt
+status=
+# expect WHAT ERRNO: the ioctl must fail with ERRNO and leave the size alone
+expect() {
+	got=$($IOCTL_RESIZE $MNT $2 $3 2>> $OUT)
+	echo "$1: $got" >> $OUT
+	test "$got" = "$4" || status="$1 got $got, wanted $4"
+}
+
+f4_image $TMPFILE 64
+f4_mkfs $TMPFILE
+old=$(f4_blocks $TMPFILE)
+dd if=/dev/zero of=$TMPFILE bs=1M count=0 seek=128 >> $OUT 2>&1
+f4_mount $TMPFILE $MNT && {
+	expect "not root" 131072 65534 EPERM
+	expect "shrink" 32768 "" EINVAL
+	expect "beyond the device" 10000000 "" EINVAL
+	expect "same size" $old "" ok
+	f4_umount $MNT
+	test "$(f4_blocks $TMPFILE)" = "$old" || status="size changed by a refused resize"
+}
+
+# layouts that are not supported: no journal, no flex_bg, bigalloc
+for layout in "^has_journal" "^flex_bg" "bigalloc"; do
+	f4_image $TMPFILE 64
+	f4_mkfs -O "$layout" $TMPFILE
+	dd if=/dev/zero of=$TMPFILE bs=1M count=0 seek=128 >> $OUT 2>&1
+	f4_mount $TMPFILE $MNT || continue
+	expect "$layout" 131072 "" EOPNOTSUPP
+	f4_umount $MNT
+	test "$(f4_blocks $TMPFILE)" = "$old" || status="$layout: size changed"
+	$FSCK -fn -N test_filesys $TMPFILE >> $OUT 2>&1 || status="$layout: fsck"
+done
+cat $OUT.fuse4fs >> $OUT 2>/dev/null
+rm -rf $MNT $MNT.lock
+if test -z "$status"; then
+	f4_pass
+else
+	f4_fail "$status"
+fi

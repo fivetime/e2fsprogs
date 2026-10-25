@@ -19,6 +19,7 @@ errcode_t ext2fs_open_journal(ext2_filsys fs, journal_t **j);
 errcode_t ext2fs_close_journal(ext2_filsys fs, journal_t **j);
 errcode_t ext2fs_run_ext3_journal(ext2_filsys *fs);
 errcode_t ext2fs_check_ext3_journal(ext2_filsys fs);
+errcode_t ext2fs_journal_sb_csum_set(journal_t *j, journal_superblock_t *jsb);
 
 void jbd2_commit_block_csum_set(journal_t *j, struct buffer_head *bh);
 void jbd2_revoke_csum_set(journal_t *j, struct buffer_head *bh);

@@ -17,14 +17,20 @@ UMANPAGES=
 @FUSE4FS_CMT@UPROGS+=fuse4fs
 @FUSE4FS_CMT@UMANPAGES+=fuse4fs.1
 
-FUSE4FS_OBJS=	fuse4fs.o journal.o recovery.o revoke.o
+FUSE4FS_OBJS=	fuse4fs.o journal.o recovery.o revoke.o journal_write.o \
+		resize_journal.o adjust.o
 
 PROFILED_FUSE4FS_OJBS=	profiled/fuse4fs.o profiled/journal.o \
-			profiled/recovery.o profiled/revoke.o
+			profiled/recovery.o profiled/revoke.o \
+			profiled/journal_write.o profiled/resize_journal.o \
+			profiled/adjust.o
 
 SRCS=\
 	$(srcdir)/fuse4fs.c \
+	$(srcdir)/resize_journal.c \
 	$(srcdir)/../debugfs/journal.c \
+	$(srcdir)/../debugfs/journal_write.c \
+	$(srcdir)/../resize/adjust.c \
 	$(srcdir)/../e2fsck/revoke.c \
 	$(srcdir)/../e2fsck/recovery.c
 
@@ -88,6 +94,24 @@ revoke.o: $(srcdir)/../e2fsck/revoke.c
 	$(Q) $(CC) -c $(JOURNAL_CFLAGS) -I$(srcdir) \
 		$(srcdir)/../e2fsck/revoke.c -o $@
 @PROFILE_CMT@	$(Q) $(CC) $(JOURNAL_CFLAGS) -g -pg -o profiled/$*.o -c $<
+
+journal_write.o: $(srcdir)/../debugfs/journal_write.c
+	$(E) "	CC $<"
+	$(Q) $(CC) -c $(JOURNAL_CFLAGS) -I$(srcdir) \
+		$(srcdir)/../debugfs/journal_write.c -o $@
+@PROFILE_CMT@	$(Q) $(CC) $(JOURNAL_CFLAGS) -g -pg -o profiled/$*.o -c $<
+
+resize_journal.o: $(srcdir)/resize_journal.c
+	$(E) "	CC $<"
+	$(Q) $(CC) -c $(JOURNAL_CFLAGS) -I$(srcdir) \
+		$(srcdir)/resize_journal.c -o $@
+@PROFILE_CMT@	$(Q) $(CC) $(JOURNAL_CFLAGS) -g -pg -o profiled/$*.o -c $<
+
+adjust.o: $(srcdir)/../resize/adjust.c
+	$(E) "	CC $<"
+	$(Q) $(CC) -c $(ALL_CFLAGS) -I$(srcdir)/../resize \
+		$(srcdir)/../resize/adjust.c -o $@
+@PROFILE_CMT@	$(Q) $(CC) $(ALL_CFLAGS) -I$(srcdir)/../resize -g -pg -o profiled/$*.o -c $<
 
 fuse4fs.1: $(DEP_SUBSTITUTE) $(srcdir)/fuse4fs.1.in
 	$(E) "	SUBST $@"

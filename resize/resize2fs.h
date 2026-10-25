@@ -146,6 +146,12 @@ extern errcode_t resize_fs(ext2_filsys fs, blk64_t *new_size, int flags,
 					    int pass, unsigned long cur,
 					    unsigned long max));
 
+/* adjust.c */
+extern int lazy_itable_init;
+extern void adjust_reserved_gdt_blocks(ext2_filsys old_fs, ext2_filsys fs);
+extern errcode_t mark_table_blocks(ext2_filsys fs, ext2fs_block_bitmap bmap);
+extern errcode_t fix_resize_inode(ext2_filsys fs);
+extern errcode_t resize2fs_calculate_summary_stats(ext2_filsys fs);
 extern errcode_t adjust_fs_info(ext2_filsys fs, ext2_filsys old_fs,
 				ext2fs_block_bitmap reserve_blocks,
 				blk64_t new_size);

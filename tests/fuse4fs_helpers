@@ -1,0 +1,94 @@
+# Shared by the r_fuse4fs_* tests, which mount an image with fuse4fs.
+# Sourced from their scripts; needs root, /dev/fuse and a built fuse4fs.
+
+fuse4fs_skip_reason() {
+	if ! test -x "$FUSE4FS_EXE"; then echo "no fuse4fs"; return; fi
+	if ! test -c /dev/fuse; then echo "no /dev/fuse"; return; fi
+	if test "$(id -u)" != 0; then echo "not root"; return; fi
+	if ! test -x "$IOCTL_RESIZE"; then echo "no ioctl_resize"; return; fi
+}
+
+# f4_image FILE MiB: a sparse image with the layout our images have, at a
+# 1k block size so that 64 MiB is eight groups, half a flex group.
+f4_image() {
+	rm -f "$1"
+	dd if=/dev/zero of="$1" bs=1M count=0 seek="$2" >> $OUT 2>&1
+}
+
+f4_mkfs() {
+	$MKE2FS -q -F -o Linux -b 1024 -I 256 -g 8192 \
+		-O has_journal,extent,huge_file,flex_bg,metadata_csum,64bit,dir_nlink,extra_isize,resize_inode,sparse_super \
+		-E lazy_itable_init=0 "$@" >> $OUT 2>&1
+}
+
+# f4_mount IMAGE MNT [options]: mounted, served by a daemon that removes
+# MNT.lock when it exits.
+f4_mount() {
+	mkdir -p "$2"
+	rm -f "$2.lock"
+	FUSE4FS_LOGFILE=$OUT.fuse4fs $FUSE4FS "$1" "$2" \
+		-o allow_other,lockfile="$2.lock"${3:+,$3} >> $OUT 2>&1
+}
+
+# f4_umount MNT: unmounts and waits for the daemon to go.
+f4_umount() {
+	umount "$1" >> $OUT 2>&1 || umount -l "$1" >> $OUT 2>&1
+	i=0
+	while test -e "$1.lock" && test $i -lt 200; do
+		sleep 0.1
+		i=$((i + 1))
+	done
+	rm -f "$1.lock"
+}
+
+f4_blocks() {
+	$DUMPE2FS -h "$1" 2>/dev/null | sed -n 's/^Block count: *//p'
+}
+
+# f4_fill MNT: a few files with known checksums, listed in $OUT.crc
+f4_fill() {
+	mkdir -p "$1/d"
+	for i in 1 2 3 4; do
+		cat $TEST_BITS $TEST_BITS $TEST_BITS > "$1/d/f$i"
+		echo "$i" >> "$1/d/f$i"
+	done
+	: > $OUT.crc
+	for i in 1 2 3 4; do
+		$CRCSUM "$1/d/f$i" >> $OUT.crc
+	done
+}
+
+# f4_verify MNT: the files still have their checksums
+f4_verify() {
+	: > $OUT.crc2
+	for i in 1 2 3 4; do
+		$CRCSUM "$1/d/f$i" >> $OUT.crc2
+	done
+	cmp -s $OUT.crc $OUT.crc2
+}
+
+# f4_tables_outside IMAGE OLD_BLOCKS OLD_GROUPS: no new group keeps its
+# bitmaps or inode table inside the old file system
+f4_tables_outside() {
+	$DUMPE2FS "$1" 2>/dev/null | awk -v old="$2" -v og="$3" '
+		/^Group [0-9]+:/ { g = $2 + 0 }
+		/Block bitmap at/ { bb = $4 + 0 }
+		/Inode bitmap at/ { ib = $4 + 0 }
+		/Inode table at/ {
+			split($4, a, "-"); it = a[1] + 0
+			if (g >= og && (bb < old || ib < old || it < old))
+				bad++
+		}
+		END { exit bad > 0 }'
+}
+
+f4_pass() {
+	echo "$test_name: $test_description: ok"
+	touch $test_name.ok
+}
+
+f4_fail() {
+	echo "$1" >> $OUT
+	ln -f $OUT $test_name.failed
+	echo "$test_name: $test_description: failed ($1)"
+}

@@ -21,7 +21,7 @@ DEBUG_OBJS= debug_cmds.o debugfs.o util.o ncheck.o icheck.o ls.o \
 	lsdel.o dump.o set_fields.o logdump.o htree.o unused.o e2freefrag.o \
 	filefrag.o extent_cmds.o extent_inode.o zap.o create_inode.o \
 	create_inode_libarchive.o quota.o xattrs.o journal.o revoke.o \
-	recovery.o do_journal.o do_orphan.o
+	recovery.o journal_write.o do_journal.o do_orphan.o
 
 RO_DEBUG_OBJS= ro_debug_cmds.o ro_debugfs.o util.o ncheck.o icheck.o ls.o \
 	lsdel.o logdump.o htree.o e2freefrag.o filefrag.o extent_cmds.o \
@@ -35,8 +35,8 @@ SRCS= debug_cmds.c $(srcdir)/debugfs.c $(srcdir)/util.c $(srcdir)/ls.c \
 	$(srcdir)/../misc/create_inode.c \
 	$(srcdir)/../misc/create_inode_libarchive.c $(srcdir)/xattrs.c \
 	$(srcdir)/quota.c $(srcdir)/journal.c $(srcdir)/../e2fsck/revoke.c \
-	$(srcdir)/../e2fsck/recovery.c $(srcdir)/do_journal.c \
-	$(srcdir)/do_orphan.c
+	$(srcdir)/../e2fsck/recovery.c $(srcdir)/journal_write.c \
+	$(srcdir)/do_journal.c $(srcdir)/do_orphan.c
 
 LIBS= $(LIBSUPPORT) $(LIBEXT2FS) $(LIBE2P) $(LIBSS) $(LIBCOM_ERR) $(LIBBLKID) \
 	$(LIBUUID) $(LIBMAGIC) $(SYSLIBS) $(LIBARCHIVE)
@@ -430,6 +430,16 @@ recovery.o: $(srcdir)/../e2fsck/recovery.c $(srcdir)/../e2fsck/jfs_user.h \
  $(top_srcdir)/lib/ext2fs/bitops.h $(top_srcdir)/lib/ext2fs/kernel-jbd.h \
  $(top_srcdir)/lib/ext2fs/jfs_compat.h $(top_srcdir)/lib/support/list.h \
  $(top_srcdir)/lib/ext2fs/compiler.h
+journal_write.o: $(srcdir)/journal_write.c $(top_builddir)/lib/config.h \
+ $(top_builddir)/lib/dirpaths.h $(top_srcdir)/lib/ext2fs/ext2fs.h \
+ $(top_builddir)/lib/ext2fs/ext2_types.h $(top_srcdir)/lib/ext2fs/ext2_fs.h \
+ $(top_srcdir)/lib/ext2fs/ext3_extents.h $(top_srcdir)/lib/et/com_err.h \
+ $(top_srcdir)/lib/ext2fs/ext2_io.h $(top_builddir)/lib/ext2fs/ext2_err.h \
+ $(top_srcdir)/lib/ext2fs/ext2_ext_attr.h $(top_srcdir)/lib/ext2fs/hashmap.h \
+ $(top_srcdir)/lib/ext2fs/bitops.h $(top_srcdir)/lib/ext2fs/kernel-jbd.h \
+ $(top_srcdir)/lib/ext2fs/jfs_compat.h $(top_srcdir)/lib/support/list.h \
+ $(top_srcdir)/lib/ext2fs/compiler.h $(srcdir)/journal.h \
+ $(srcdir)/../e2fsck/jfs_user.h $(srcdir)/journal_write.h
 do_journal.o: $(srcdir)/do_journal.c $(top_builddir)/lib/config.h \
  $(top_builddir)/lib/dirpaths.h $(srcdir)/debugfs.h $(top_srcdir)/lib/ss/ss.h \
  $(top_builddir)/lib/ss/ss_err.h $(top_srcdir)/lib/et/com_err.h \

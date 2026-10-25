@@ -80,8 +80,7 @@ static int ext2fs_journal_sb_csum_verify(journal_t *j,
 	return provided == calculated;
 }
 
-static errcode_t ext2fs_journal_sb_csum_set(journal_t *j,
-					    journal_superblock_t *jsb)
+errcode_t ext2fs_journal_sb_csum_set(journal_t *j, journal_superblock_t *jsb)
 {
 	__u32 crc;
 
