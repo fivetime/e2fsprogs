@@ -9,7 +9,7 @@ fi
 
 MNT=$TMPFILE.mnt
 status=
-for point in before-sb after-sb after-commit mid-writeback; do
+for point in before-sb after-sb mid-commit after-commit mid-writeback; do
 	echo "--- server dies at $point" >> $OUT
 	f4_image $TMPFILE 64
 	f4_mkfs $TMPFILE
@@ -30,6 +30,9 @@ for point in before-sb after-sb after-commit mid-writeback; do
 	now=$(f4_blocks $TMPFILE)
 	echo "after $point: $old -> $now blocks" >> $OUT
 	test "$now" = "$old" -o "$now" = "131072" || { status="size $now after $point"; break; }
+	# before the commit the old size; the journal must be empty afterwards
+	case $point in before-sb|after-sb|mid-commit) test "$now" = "$old" || { status="new size after $point"; break; };; esac
+	$DUMPE2FS -h $TMPFILE 2>/dev/null | grep -q "^Journal start: *0$" || { status="journal not empty after $point"; break; }
 done
 rm -rf $MNT $MNT.lock
 if test -z "$status"; then

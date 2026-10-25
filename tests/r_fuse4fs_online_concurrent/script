@@ -1,0 +1,72 @@
+. $cmd_dir/fuse4fs_helpers
+OUT=$test_name.log
+rm -f $OUT $OUT.*
+reason=$(fuse4fs_skip_reason)
+if test -n "$reason"; then
+	echo "$test_name: $test_description: skipped ($reason)"
+	return 0
+fi
+
+MNT=$TMPFILE.mnt
+status=
+# The new inode tables are zeroed with the lock dropped; FUSE4FS_RESIZE_ZERO_DELAY
+# keeps that window open for 4 seconds so that other requests can be seen to go
+# through, and so that a shutdown can land in it.
+echo "--- writes and statfs while the resize zeroes" >> $OUT
+f4_image $TMPFILE 64
+f4_mkfs $TMPFILE
+old=$(f4_blocks $TMPFILE)
+FUSE4FS_RESIZE_ZERO_DELAY=4 f4_mount $TMPFILE $MNT || status="mount"
+if test -z "$status"; then
+	f4_fill $MNT
+	dd if=/dev/zero of=$TMPFILE bs=1M count=0 seek=1024 >> $OUT 2>&1
+	$RESIZE2FS $TMPFILE >> $OUT 2>&1 &
+	rpid=$!
+	sleep 1
+	t0=$SECONDS
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		echo "$i" > $MNT/d/during$i || status="write during zeroing"
+		stat -f $MNT > /dev/null || status="statfs during zeroing"
+	done
+	sync
+	echo "writes took $((SECONDS - t0))s" >> $OUT
+	test $((SECONDS - t0)) -lt 3 || status="requests blocked during zeroing"
+	wait $rpid || status="resize2fs failed"
+	f4_verify $MNT || status="data"
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		test "$(cat $MNT/d/during$i)" = "$i" || status="file written during zeroing lost"
+	done
+	f4_umount $MNT
+	cat $OUT.fuse4fs >> $OUT 2>/dev/null
+	$FSCK -fn -N test_filesys $TMPFILE >> $OUT 2>&1 || status="fsck"
+	test "$(f4_blocks $TMPFILE)" = "$((1024 * 1024))" || status="size $(f4_blocks $TMPFILE)"
+fi
+
+if test -z "$status"; then
+	echo "--- shutdown while the resize zeroes" >> $OUT
+	f4_image $TMPFILE 64
+	f4_mkfs $TMPFILE
+	old=$(f4_blocks $TMPFILE)
+	FUSE4FS_RESIZE_ZERO_DELAY=4 f4_mount $TMPFILE $MNT || status="mount 2"
+fi
+if test -z "$status"; then
+	f4_fill $MNT
+	sync
+	dd if=/dev/zero of=$TMPFILE bs=1M count=0 seek=128 >> $OUT 2>&1
+	$RESIZE2FS $TMPFILE >> $OUT 2>&1 &
+	rpid=$!
+	sleep 1
+	$IOCTL_RESIZE -s $MNT >> $OUT 2>&1 || status="shutdown"
+	wait $rpid && status="resize2fs succeeded after shutdown"
+	f4_umount $MNT
+	cat $OUT.fuse4fs >> $OUT 2>/dev/null
+	grep -q "went read-only" $OUT || status="no read-only refusal logged"
+	$FSCK -fn -N test_filesys $TMPFILE >> $OUT 2>&1 || status="fsck after shutdown"
+	test "$(f4_blocks $TMPFILE)" = "$old" || status="size changed after shutdown"
+fi
+rm -rf $MNT $MNT.lock
+if test -z "$status"; then
+	f4_pass
+else
+	f4_fail "$status"
+fi

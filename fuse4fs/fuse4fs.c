@@ -5453,9 +5453,19 @@ extern errcode_t fix_resize_inode(ext2_filsys fs);
 extern errcode_t resize2fs_calculate_summary_stats(ext2_filsys fs);
 
 /*
- * Test hook: FUSE4FS_RESIZE_FAULT names a point of the resize at which the
- * server exits without flushing anything, as a crash would leave the disk.
+ * Test hooks: FUSE4FS_RESIZE_FAULT names a point of the resize at which the
+ * server exits without flushing anything, as a crash would leave the disk;
+ * FUSE4FS_RESIZE_ZERO_DELAY holds the resize for that many seconds after
+ * zeroing the new inode tables, with the big lock dropped.
  */
+static void f4r_test_delay(void)
+{
+	const char *delay = getenv("FUSE4FS_RESIZE_ZERO_DELAY");
+
+	if (delay)
+		sleep(atoi(delay));
+}
+
 static void f4r_fault(const char *point)
 {
 	const char *want = getenv("FUSE4FS_RESIZE_FAULT");
@@ -5976,8 +5986,9 @@ static int f4r_check(struct fuse4fs *ff, ext2_filsys fs, blk64_t new_blocks,
 		return f4r_refuse(ff, EPERM, _("the file system has errors"));
 	if (ext2fs_has_feature_journal_needs_recovery(sb))
 		return f4r_refuse(ff, EOPNOTSUPP, _("the journal needs recovery"));
-	if (ext2fs_has_feature_mmp(sb) && (fs->flags & EXT2_FLAG_SKIP_MMP))
-		return f4r_refuse(ff, EOPNOTSUPP, _("MMP is not being maintained"));
+	/* ext2fs_dup_handle() starts the copy without the MMP state */
+	if (ext2fs_has_feature_mmp(sb))
+		return f4r_refuse(ff, EOPNOTSUPP, _("MMP is not supported"));
 
 	if (new_blocks == old_blocks)
 		return 0;
@@ -6096,7 +6107,16 @@ static int ioctl_resize_fs(struct fuse4fs *ff, const struct fuse_ctx *ctxt,
 
 	/*
 	 * Zero them with the lock dropped: they are beyond the file system,
-	 * so no other operation can see or touch them.
+	 * so no other operation can see or touch them, and zeroing gigabytes
+	 * under the lock would stall the guest.  Meanwhile other requests
+	 * read and write through the same channel: unix_io opened with
+	 * EXT2_FLAG_THREADS serialises its cache and statistics with its own
+	 * mutexes, zeroout bypasses the cache (fallocate on the descriptor)
+	 * and these blocks are not in it anyway, nothing having touched them.
+	 * The mount cannot be destroyed under us either: the caller holds the
+	 * mount point open for the ioctl, so the superblock stays, and we
+	 * come back to check that the file system is still writable before
+	 * anything is written.
 	 */
 	pthread_mutex_unlock(&ff->bfl);
 	err = 0;
@@ -6106,6 +6126,7 @@ static int ioctl_resize_fs(struct fuse4fs *ff, const struct fuse_ctx *ctxt,
 					  NULL);
 	if (!err)
 		err = io_channel_flush(fs->io);
+	f4r_test_delay();
 	pthread_mutex_lock(&ff->bfl);
 	if (err) {
 		ret = translate_error(fs, 0, err);
@@ -6115,7 +6136,7 @@ static int ioctl_resize_fs(struct fuse4fs *ff, const struct fuse_ctx *ctxt,
 	/* Second pass, under the lock: has anything moved meanwhile? */
 	fs = ff->fs;
 	if (!fuse4fs_is_writeable(ff)) {
-		ret = -EROFS;
+		ret = f4r_refuse(ff, EROFS, _("the file system went read-only meanwhile"));
 		goto out;
 	}
 	if (ext2fs_blocks_count(fs->super) != old_blocks) {
@@ -6283,7 +6304,27 @@ static int ioctl_resize_fs(struct fuse4fs *ff, const struct fuse_ctx *ctxt,
 	if (err)
 		goto fatal;
 
-	/* Run on the grown file system from now on; drop the old handle unflushed */
+	/*
+	 * Run on the grown file system from now on.  nfs came from
+	 * ext2fs_dup_handle(), so everything fuse4fs keeps on the handle is
+	 * accounted for:
+	 *  - the struct itself is a copy: priv_data still points at ff, the
+	 *    flags, block size, umask and the encoding table pointer come
+	 *    along, and fuse4fs installs no libext2fs callbacks;
+	 *  - io (and image_io, the same channel) is shared with a reference
+	 *    count, bumped by the dup and dropped by ext2fs_free() below;
+	 *  - icache, libext2fs' inode cache, is shared the same way;
+	 *  - super, orig_super, group_desc and the two bitmaps were copied
+	 *    and are the resized versions now, orig_super matching the disk;
+	 *  - dblist and badblocks are not used by fuse4fs, quotas are
+	 *    refused at mount and MMP by f4r_check(), so none of them exist;
+	 *  - the orphan list lives in the superblock and in the inodes;
+	 *  - ff->inodes (fuse4fs' inode cache) and the file handles hold
+	 *    inode numbers, not the handle, and the MMP thread, the ioctl
+	 *    handlers and every operation take ff->fs under the lock we hold.
+	 * The old handle is freed without a flush: its superblock still says
+	 * needs_recovery and its bitmaps are the old ones.
+	 */
 	ff->fs = nfs;
 	nfs = NULL;
 	ext2fs_free(fs);

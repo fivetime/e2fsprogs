@@ -29,8 +29,8 @@ f4_mount $TMPFILE $MNT && {
 	test "$(f4_blocks $TMPFILE)" = "$old" || status="size changed by a refused resize"
 }
 
-# layouts that are not supported: no journal, no flex_bg, bigalloc
-for layout in "^has_journal" "^flex_bg" "bigalloc"; do
+# layouts that are not supported: no journal, no flex_bg, bigalloc, MMP
+for layout in "^has_journal" "^flex_bg" "bigalloc" "mmp"; do
 	f4_image $TMPFILE 64
 	f4_mkfs -O "$layout" $TMPFILE
 	dd if=/dev/zero of=$TMPFILE bs=1M count=0 seek=128 >> $OUT 2>&1
