@@ -1,0 +1,47 @@
+. $cmd_dir/fuse4fs_helpers
+OUT=$test_name.log
+rm -f $OUT $OUT.*
+reason=$(fuse4fs_skip_reason)
+if test -n "$reason"; then
+	echo "$test_name: $test_description: skipped ($reason)"
+	return 0
+fi
+
+MNT=$TMPFILE.mnt
+status=
+# 64 MiB is half a flex group: 128 MiB completes it, 256 MiB needs a second
+# descriptor block, 1 GiB adds many groups.
+for new in 128 256 1024; do
+	echo "--- grow 64M -> ${new}M" >> $OUT
+	f4_image $TMPFILE 64
+	f4_mkfs $TMPFILE
+	old=$(f4_blocks $TMPFILE)
+	oldgroups=$(( (old + 8191) / 8192 ))
+	f4_mount $TMPFILE $MNT || { status="mount"; break; }
+	f4_fill $MNT
+	dd if=/dev/zero of=$TMPFILE bs=1M count=0 seek=$new >> $OUT 2>&1
+	$RESIZE2FS $TMPFILE >> $OUT 2>&1 || { status="resize2fs"; f4_umount $MNT; break; }
+	f4_verify $MNT || { status="data"; f4_umount $MNT; break; }
+	echo more > $MNT/d/after
+	# the same size again is a no-op
+	$RESIZE2FS $TMPFILE >> $OUT 2>&1 || { status="resize2fs again"; f4_umount $MNT; break; }
+	f4_umount $MNT
+	cat $OUT.fuse4fs >> $OUT 2>/dev/null
+	$FSCK -fn -N test_filesys $TMPFILE >> $OUT 2>&1 || { status="fsck"; break; }
+	now=$(f4_blocks $TMPFILE)
+	test "$now" = "$((new * 1024))" || { status="size $now"; break; }
+	f4_tables_outside $TMPFILE $old $oldgroups || { status="tables inside"; break; }
+	$DUMPE2FS -h $TMPFILE 2>/dev/null | grep -q "^Journal start: *0$" || { status="journal not empty"; break; }
+	$DUMPE2FS -h $TMPFILE 2>/dev/null | grep -q needs_recovery && { status="needs_recovery left"; break; }
+	# and fuse4fs mounts the result again
+	f4_mount $TMPFILE $MNT || { status="remount"; break; }
+	f4_verify $MNT || { status="data after remount"; f4_umount $MNT; break; }
+	f4_umount $MNT
+	$FSCK -fn -N test_filesys $TMPFILE >> $OUT 2>&1 || { status="fsck after remount"; break; }
+done
+rm -rf $MNT $MNT.lock
+if test -z "$status"; then
+	f4_pass
+else
+	f4_fail "$status"
+fi

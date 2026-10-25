@@ -1,0 +1,32 @@
+. $cmd_dir/fuse4fs_helpers
+OUT=$test_name.log
+rm -f $OUT $OUT.*
+reason=$(fuse4fs_skip_reason)
+if test -n "$reason"; then
+	echo "$test_name: $test_description: skipped ($reason)"
+	return 0
+fi
+
+MNT=$TMPFILE.mnt
+status=
+f4_image $TMPFILE 64
+f4_mkfs $TMPFILE
+# kernel mode: the kernel checks permissions and may withhold the caller's
+# ids, which used to make fuse4fs strip S_ISGID from root's own chmod
+f4_mount $TMPFILE $MNT kernel || status="mount"
+if test -z "$status"; then
+	: > $MNT/f
+	chgrp 65534 $MNT/f
+	chmod 2755 $MNT/f
+	mode=$(stat -c %a $MNT/f)
+	echo "mode after chmod 2755 by root: $mode" >> $OUT
+	test "$mode" = 2755 || status="mode $mode"
+	f4_umount $MNT
+fi
+cat $OUT.fuse4fs >> $OUT 2>/dev/null
+rm -rf $MNT $MNT.lock
+if test -z "$status"; then
+	f4_pass
+else
+	f4_fail "$status"
+fi

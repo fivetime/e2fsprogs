@@ -1,0 +1,1 @@
+fuse4fs: chmod g+s by root keeps S_ISGID in kernel mode

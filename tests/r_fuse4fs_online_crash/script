@@ -1,0 +1,39 @@
+. $cmd_dir/fuse4fs_helpers
+OUT=$test_name.log
+rm -f $OUT $OUT.*
+reason=$(fuse4fs_skip_reason)
+if test -n "$reason"; then
+	echo "$test_name: $test_description: skipped ($reason)"
+	return 0
+fi
+
+MNT=$TMPFILE.mnt
+status=
+for point in before-sb after-sb after-commit mid-writeback; do
+	echo "--- server dies at $point" >> $OUT
+	f4_image $TMPFILE 64
+	f4_mkfs $TMPFILE
+	old=$(f4_blocks $TMPFILE)
+	FUSE4FS_RESIZE_FAULT=$point f4_mount $TMPFILE $MNT || { status="mount"; break; }
+	f4_fill $MNT
+	sync
+	dd if=/dev/zero of=$TMPFILE bs=1M count=0 seek=128 >> $OUT 2>&1
+	$RESIZE2FS $TMPFILE >> $OUT 2>&1 && { status="resize2fs succeeded at $point"; f4_umount $MNT; break; }
+	f4_umount $MNT
+	cat $OUT.fuse4fs >> $OUT 2>/dev/null
+	# the next mount replays whatever the journal holds
+	f4_mount $TMPFILE $MNT || { status="remount after $point"; break; }
+	f4_verify $MNT || { status="data after $point"; f4_umount $MNT; break; }
+	echo more > $MNT/d/after
+	f4_umount $MNT
+	$FSCK -fn -N test_filesys $TMPFILE >> $OUT 2>&1 || { status="fsck after $point"; break; }
+	now=$(f4_blocks $TMPFILE)
+	echo "after $point: $old -> $now blocks" >> $OUT
+	test "$now" = "$old" -o "$now" = "131072" || { status="size $now after $point"; break; }
+done
+rm -rf $MNT $MNT.lock
+if test -z "$status"; then
+	f4_pass
+else
+	f4_fail "$status"
+fi
