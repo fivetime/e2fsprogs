@@ -92,6 +92,20 @@ do not open the block device O_EXCL. Needed when the mount point is
 \fI/dev/fd/N\fR, a fuseblk connection that a privileged caller created and
 handed over: the kernel then holds the device and O_EXCL fails with EBUSY.
 .TP
+\fB-o\fR host_authorized_resize
+allow \fBEXT4_IOC_RESIZE_FS\fR (online growing, as
+.BR resize2fs (8)
+issues it on a mounted file system) from callers whose uid the kernel does
+not pass on.  In kernel mode the kernel may idmap the mount and then sends
+the caller's ids only with requests that create files; other requests arrive
+without them and
+.B fuse4fs
+cannot tell root from anyone else.  With this option it trusts that whoever
+set up the mount checks the callers itself, as a container manager does when
+it intercepts the ioctl and requires \fBCAP_SYS_RESOURCE\fR in the
+container.  Without it such a request is refused with \fBEPERM\fR.  When the
+kernel does pass the uid, only the superuser may resize, option or not.
+.TP
 \fB-o\fR no_default_opts
 do not include default fuse options
 .TP

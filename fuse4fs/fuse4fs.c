@@ -57,6 +57,7 @@
 #include "../version.h"
 #include "uuid/uuid.h"
 #include "e2p/e2p.h"
+#include "resize_journal.h"
 
 #ifdef ENABLE_NLS
 #include <libintl.h>
@@ -248,6 +249,7 @@ struct fuse4fs {
 	pthread_mutex_t bfl;
 	char *device;
 	char *shortdev;
+	char *device_path;	/* device, made absolute before libfuse chdirs */
 
 	/* options set by fuse_opt_parse must be of type int */
 	int ro;
@@ -263,6 +265,8 @@ struct fuse4fs {
 	int noexcl;
 	int acl;
 	int dirsync;
+	int host_authorized_resize;
+	int resize_in_progress;
 
 	enum fuse4fs_opstate opstate;
 	int logfd;
@@ -1106,6 +1110,17 @@ static inline int fuse4fs_want_check_owner(struct fuse4fs *ff,
 	if (ff->kernel)
 		return 0;
 	return !fuse4fs_is_superuser(ff, ctxt);
+}
+
+/*
+ * A kernel that may idmap this mount (kernel mode) sends the caller's ids
+ * only with requests that create something; every other request carries
+ * FUSE_INVALID_UIDGID, having been checked by the kernel already.
+ */
+static inline int fuse4fs_caller_checked_by_kernel(struct fuse4fs *ff,
+						   const struct fuse_ctx *ctxt)
+{
+	return ff->kernel && ctxt->uid == (uid_t)-1;
 }
 
 /* Test for append permission */
@@ -5396,6 +5411,920 @@ static int ioctl_shutdown(struct fuse4fs *ff, const struct fuse_ctx *ctxt,
 	return 0;
 }
 
+/*
+ * Online resize
+ * =============
+ *
+ * EXT4_IOC_RESIZE_FS grows the file system to the number of blocks the
+ * caller asks for, with the mount in use.  The layout work is adjust_fs_info()
+ * from resize2fs, run on a copy of the file system handle.  What makes it
+ * safe against a crash is how the result reaches the disk:
+ *
+ *  - blocks beyond the old file system (the bitmaps and inode tables of the
+ *    new groups, their backup superblocks and descriptors) belong to nobody
+ *    yet, so they are written directly;
+ *  - blocks inside the old file system that change (the superblock, the
+ *    group descriptors, the last old group's bitmap, the resize inode's
+ *    blocks) are held back by a stacked io_manager and written as one
+ *    committed journal transaction, then written home, then the journal is
+ *    emptied.  fuse4fs replays the journal when it mounts, so a crash before
+ *    the commit leaves the old file system and a crash after it leaves a
+ *    transaction that completes the resize.
+ *
+ * The new inode tables are zeroed before any of that, with the big lock
+ * dropped: they are beyond the end of the file system, so nothing else can
+ * touch them, and zeroing gigabytes under the lock would stall the guest.
+ * The layout is computed twice, once to learn where the tables go and once
+ * under the lock to do the work, and the second must agree with the first.
+ *
+ * Only the layout our images have is supported: an internal journal,
+ * resize_inode, flex_bg, 64bit, metadata_csum, extents and sparse_super,
+ * growing, within what the reserved GDT blocks allow.  Anything else is
+ * refused with EOPNOTSUPP before the disk is touched; resize2fs offline
+ * handles those.
+ */
+
+/* adjust.c, shared with resize2fs */
+extern int lazy_itable_init;
+extern errcode_t adjust_fs_info(ext2_filsys fs, ext2_filsys old_fs,
+				ext2fs_block_bitmap reserve_blocks,
+				blk64_t new_size);
+extern errcode_t fix_resize_inode(ext2_filsys fs);
+extern errcode_t resize2fs_calculate_summary_stats(ext2_filsys fs);
+
+/*
+ * Test hook: FUSE4FS_RESIZE_FAULT names a point of the resize at which the
+ * server exits without flushing anything, as a crash would leave the disk.
+ */
+static void f4r_fault(const char *point)
+{
+	const char *want = getenv("FUSE4FS_RESIZE_FAULT");
+
+	if (want && strcmp(want, point) == 0) {
+		fprintf(stderr, "FUSE4FS: resize fault injected at %s\n", point);
+		fflush(stderr);
+		_exit(1);
+	}
+}
+
+/*
+ * An io_manager stacked on the file system's channel while the resize is
+ * laid out.  Writes beyond the old file system go through; writes inside it
+ * are kept here (and dropped when they leave the block as it is on disk) to
+ * become the journal transaction.  Reads see the kept blocks.
+ */
+struct f4r_stash_block {
+	blk64_t blk;
+	char *data;
+};
+
+struct f4r_stash {
+	io_channel real;
+	unsigned int fs_blocksize;
+	blk64_t old_blocks;
+	struct f4r_stash_block *blocks;
+	size_t nr, cap;
+};
+
+static struct f4r_stash_block *f4r_stash_find(struct f4r_stash *st,
+					      blk64_t blk)
+{
+	size_t i;
+
+	for (i = 0; i < st->nr; i++)
+		if (st->blocks[i].blk == blk)
+			return &st->blocks[i];
+	return NULL;
+}
+
+static errcode_t f4r_stash_put(struct f4r_stash *st, blk64_t blk,
+			       const char *data)
+{
+	struct f4r_stash_block *b = f4r_stash_find(st, blk);
+	errcode_t err;
+
+	if (!b) {
+		if (st->nr == st->cap) {
+			size_t ncap = st->cap ? st->cap * 2 : 64;
+
+			err = ext2fs_resize_mem(st->cap * sizeof(*st->blocks),
+						ncap * sizeof(*st->blocks),
+						&st->blocks);
+			if (err)
+				return err;
+			st->cap = ncap;
+		}
+		b = &st->blocks[st->nr];
+		err = ext2fs_get_mem(st->fs_blocksize, &b->data);
+		if (err)
+			return err;
+		b->blk = blk;
+		st->nr++;
+	}
+	memcpy(b->data, data, st->fs_blocksize);
+	return 0;
+}
+
+static void f4r_stash_drop(struct f4r_stash *st, struct f4r_stash_block *b)
+{
+	ext2fs_free_mem(&b->data);
+	*b = st->blocks[st->nr - 1];
+	st->nr--;
+}
+
+/*
+ * The channel's block size follows set_blksize (libext2fs switches to 1024
+ * to write the superblock), so work in bytes and map onto file system blocks.
+ */
+static errcode_t f4r_stash_rw(io_channel ch, unsigned long long block,
+			      int count, void *data, int write)
+{
+	struct f4r_stash *st = ch->private_data;
+	unsigned int bs = st->fs_blocksize;
+	unsigned long long off = block * ch->block_size;
+	size_t len = count < 0 ? (size_t)-count : (size_t)count * ch->block_size;
+	char *p = data, *buf = NULL, *disk = NULL;
+	errcode_t err;
+
+	err = ext2fs_get_array(2, bs, &buf);
+	if (err)
+		return err;
+	disk = buf + bs;
+
+	while (len) {
+		blk64_t blk = off / bs;
+		unsigned int in = off % bs;
+		size_t n = bs - in;
+		struct f4r_stash_block *b;
+
+		if (n > len)
+			n = len;
+		b = f4r_stash_find(st, blk);
+
+		if (!write) {
+			if (b)
+				memcpy(p, b->data + in, n);
+			else if (in == 0 && n == bs)
+				err = io_channel_read_blk64(st->real, blk, 1, p);
+			else {
+				err = io_channel_read_blk64(st->real, blk, 1,
+							    buf);
+				if (!err)
+					memcpy(p, buf + in, n);
+			}
+		} else if (blk >= st->old_blocks) {
+			/* Beyond the old file system: nothing there is in use */
+			if (in == 0 && n == bs) {
+				err = io_channel_write_blk64(st->real, blk, 1,
+							     p);
+			} else {
+				err = io_channel_read_blk64(st->real, blk, 1,
+							    buf);
+				if (err == EXT2_ET_SHORT_READ) {
+					memset(buf, 0, bs);
+					err = 0;
+				}
+				if (!err) {
+					memcpy(buf + in, p, n);
+					err = io_channel_write_blk64(st->real,
+								     blk, 1,
+								     buf);
+				}
+			}
+		} else {
+			err = io_channel_read_blk64(st->real, blk, 1, disk);
+			if (err)
+				break;
+			memcpy(buf, b ? b->data : disk, bs);
+			memcpy(buf + in, p, n);
+			/* Nothing to journal if the block is what the disk has */
+			if (memcmp(buf, disk, bs) == 0) {
+				if (b)
+					f4r_stash_drop(st, b);
+			} else {
+				err = f4r_stash_put(st, blk, buf);
+			}
+		}
+		if (err)
+			break;
+		off += n;
+		p += n;
+		len -= n;
+	}
+
+	ext2fs_free_mem(&buf);
+	return err;
+}
+
+static errcode_t f4r_stash_open(const char *name EXT2FS_ATTR((unused)),
+				int flags EXT2FS_ATTR((unused)),
+				io_channel *channel EXT2FS_ATTR((unused)))
+{
+	return EXT2_ET_UNIMPLEMENTED;
+}
+
+static errcode_t f4r_stash_close(io_channel ch)
+{
+	struct f4r_stash *st = ch->private_data;
+	size_t i;
+
+	if (--ch->refcount > 0)
+		return 0;
+
+	for (i = 0; i < st->nr; i++)
+		ext2fs_free_mem(&st->blocks[i].data);
+	ext2fs_free_mem(&st->blocks);
+	ext2fs_free_mem(&st);
+	ext2fs_free_mem(&ch->name);
+	ext2fs_free_mem(&ch);
+	return 0;
+}
+
+static errcode_t f4r_stash_set_blksize(io_channel ch, int blksize)
+{
+	ch->block_size = blksize;
+	return 0;
+}
+
+static errcode_t f4r_stash_read_blk(io_channel ch, unsigned long block,
+				    int count, void *data)
+{
+	return f4r_stash_rw(ch, block, count, data, 0);
+}
+
+static errcode_t f4r_stash_write_blk(io_channel ch, unsigned long block,
+				     int count, const void *data)
+{
+	return f4r_stash_rw(ch, block, count, (void *)data, 1);
+}
+
+static errcode_t f4r_stash_read_blk64(io_channel ch, unsigned long long block,
+				      int count, void *data)
+{
+	return f4r_stash_rw(ch, block, count, data, 0);
+}
+
+static errcode_t f4r_stash_write_blk64(io_channel ch,
+				       unsigned long long block, int count,
+				       const void *data)
+{
+	return f4r_stash_rw(ch, block, count, (void *)data, 1);
+}
+
+static errcode_t f4r_stash_flush(io_channel ch)
+{
+	struct f4r_stash *st = ch->private_data;
+
+	return io_channel_flush(st->real);
+}
+
+static errcode_t f4r_stash_set_option(io_channel ch, const char *option,
+				      const char *arg)
+{
+	struct f4r_stash *st = ch->private_data;
+
+	if (st->real->manager->set_option)
+		return st->real->manager->set_option(st->real, option, arg);
+	return EXT2_ET_INVALID_ARGUMENT;
+}
+
+static errcode_t f4r_stash_get_stats(io_channel ch, io_stats *stats)
+{
+	struct f4r_stash *st = ch->private_data;
+
+	if (st->real->manager->get_stats)
+		return st->real->manager->get_stats(st->real, stats);
+	return EXT2_ET_INVALID_ARGUMENT;
+}
+
+static errcode_t f4r_stash_discard(io_channel ch, unsigned long long block,
+				   unsigned long long count)
+{
+	struct f4r_stash *st = ch->private_data;
+
+	/* Inside the old file system the contents must stay known */
+	if (block < st->old_blocks)
+		return 0;
+	return io_channel_discard(st->real, block, count);
+}
+
+static errcode_t f4r_stash_zeroout(io_channel ch, unsigned long long block,
+				   unsigned long long count)
+{
+	struct f4r_stash *st = ch->private_data;
+	char *zero;
+	errcode_t err;
+
+	if (block >= st->old_blocks)
+		return io_channel_zeroout(st->real, block, count);
+
+	/* Inside the old file system zeroes are a change to journal */
+	err = ext2fs_get_memzero(st->fs_blocksize, &zero);
+	if (err)
+		return err;
+	for (; count && !err; count--, block++)
+		err = f4r_stash_rw(ch, block * st->fs_blocksize / ch->block_size,
+				   -(int)st->fs_blocksize, zero, 1);
+	ext2fs_free_mem(&zero);
+	return err;
+}
+
+static errcode_t f4r_stash_cache_readahead(io_channel ch,
+					   unsigned long long block,
+					   unsigned long long count)
+{
+	struct f4r_stash *st = ch->private_data;
+
+	return io_channel_cache_readahead(st->real, block, count);
+}
+
+static struct struct_io_manager f4r_stash_manager = {
+	.magic		= EXT2_ET_MAGIC_IO_MANAGER,
+	.name		= "fuse4fs resize stash",
+	.open		= f4r_stash_open,
+	.close		= f4r_stash_close,
+	.set_blksize	= f4r_stash_set_blksize,
+	.read_blk	= f4r_stash_read_blk,
+	.write_blk	= f4r_stash_write_blk,
+	.flush		= f4r_stash_flush,
+	/* no write_byte: the superblock must come through as a block */
+	.set_option	= f4r_stash_set_option,
+	.get_stats	= f4r_stash_get_stats,
+	.read_blk64	= f4r_stash_read_blk64,
+	.write_blk64	= f4r_stash_write_blk64,
+	.discard	= f4r_stash_discard,
+	.cache_readahead = f4r_stash_cache_readahead,
+	.zeroout	= f4r_stash_zeroout,
+};
+
+static errcode_t f4r_stash_create(io_channel real, unsigned int fs_blocksize,
+				  blk64_t old_blocks, io_channel *ret)
+{
+	io_channel ch = NULL;
+	struct f4r_stash *st = NULL;
+	errcode_t err;
+
+	err = ext2fs_get_memzero(sizeof(*ch), &ch);
+	if (err)
+		return err;
+	err = ext2fs_get_memzero(sizeof(*st), &st);
+	if (err)
+		goto fail;
+	err = ext2fs_get_mem(strlen(real->name) + 1, &ch->name);
+	if (err)
+		goto fail;
+	strcpy(ch->name, real->name);
+
+	st->real = real;
+	st->fs_blocksize = fs_blocksize;
+	st->old_blocks = old_blocks;
+
+	ch->magic = EXT2_ET_MAGIC_IO_CHANNEL;
+	ch->manager = &f4r_stash_manager;
+	ch->block_size = fs_blocksize;
+	ch->refcount = 1;
+	ch->flags = real->flags;
+	ch->align = real->align;
+	ch->private_data = st;
+	*ret = ch;
+	return 0;
+fail:
+	if (st)
+		ext2fs_free_mem(&st);
+	ext2fs_free_mem(&ch);
+	return err;
+}
+
+static int f4r_stash_cmp(const void *a, const void *b)
+{
+	const struct f4r_stash_block *x = a, *y = b;
+
+	return x->blk < y->blk ? -1 : x->blk > y->blk;
+}
+
+/* Where the new groups' tables went, to compare the two layout passes. */
+struct f4r_layout {
+	blk64_t new_blocks;
+	dgrp_t old_groups, new_groups;
+	blk64_t *tables;	/* block bitmap, inode bitmap, inode table */
+};
+
+static int f4r_refuse(struct fuse4fs *ff, int err, const char *why)
+{
+	err_printf(ff, "%s: %s.\n", _("online resize refused"), why);
+	return -err;
+}
+
+/*
+ * Lay the grown file system out on a copy of fs, with the new groups' tables
+ * beyond the old file system: adjust_fs_info() places them in the first free
+ * blocks it finds, so the old file system is masked as in use while it runs
+ * and the mask is taken off afterwards.  With io the copy writes through
+ * that channel.
+ */
+static int f4r_layout(struct fuse4fs *ff, ext2_filsys fs, blk64_t new_blocks,
+		      io_channel io, ext2_filsys *nfsp, struct f4r_layout *lay)
+{
+	ext2_filsys nfs = NULL;
+	ext2fs_block_bitmap saved = NULL;
+	blk64_t old_blocks = ext2fs_blocks_count(fs->super);
+	blk64_t first = fs->super->s_first_data_block, blk;
+	__u32 *free_before = NULL;
+	char *bits = NULL;
+	dgrp_t g;
+	size_t chunk = 1U << 16;
+	errcode_t err;
+	int ret = 0;
+
+	lay->tables = NULL;
+	err = ext2fs_dup_handle(fs, &nfs);
+	if (err)
+		return translate_error(fs, 0, err);
+	if (io)
+		nfs->io = io;
+
+	err = ext2fs_copy_bitmap(nfs->block_map, &saved);
+	if (err)
+		goto fail;
+	err = ext2fs_get_array(fs->group_desc_count, sizeof(*free_before),
+			       &free_before);
+	if (err)
+		goto fail;
+	for (g = 0; g < fs->group_desc_count; g++)
+		free_before[g] = ext2fs_bg_free_blocks_count(nfs, g);
+
+	/* Keep adjust_fs_info() out of the old file system */
+	for (blk = first; blk < old_blocks; blk += chunk) {
+		size_t n = chunk;
+
+		if (blk + n > old_blocks)
+			n = old_blocks - blk;
+		ext2fs_mark_block_bitmap_range2(nfs->block_map, blk, n);
+	}
+
+	/* The inode tables are zeroed here, not left to anyone */
+	lazy_itable_init = 1;
+	err = adjust_fs_info(nfs, fs, NULL, new_blocks);
+	if (err)
+		goto fail;
+
+	lay->new_blocks = ext2fs_blocks_count(nfs->super);
+	lay->old_groups = fs->group_desc_count;
+	lay->new_groups = nfs->group_desc_count;
+	if (lay->new_groups < lay->old_groups) {
+		ret = f4r_refuse(ff, EINVAL, _("the file system would lose block groups"));
+		goto out;
+	}
+	err = ext2fs_get_array(3 * (lay->new_groups - lay->old_groups) + 1,
+			       sizeof(*lay->tables), &lay->tables);
+	if (err)
+		goto fail;
+	for (g = lay->old_groups; g < lay->new_groups; g++) {
+		blk64_t *t = &lay->tables[3 * (g - lay->old_groups)];
+
+		t[0] = ext2fs_block_bitmap_loc(nfs, g);
+		t[1] = ext2fs_inode_bitmap_loc(nfs, g);
+		t[2] = ext2fs_inode_table_loc(nfs, g);
+		if (t[0] < old_blocks || t[1] < old_blocks ||
+		    t[2] < old_blocks) {
+			ret = f4r_refuse(ff, EOPNOTSUPP,
+ _("a new block group's metadata would land inside the old file system"));
+			goto out;
+		}
+	}
+	for (g = 0; g < lay->old_groups; g++) {
+		if (ext2fs_bg_free_blocks_count(nfs, g) < free_before[g]) {
+			ret = f4r_refuse(ff, EOPNOTSUPP,
+ _("the layout allocated blocks inside the old file system"));
+			goto out;
+		}
+	}
+
+	/* Nothing was allocated in the old file system: take the mask off */
+	err = ext2fs_get_mem(chunk / 8, &bits);
+	if (err)
+		goto fail;
+	for (blk = first; blk < old_blocks; blk += chunk) {
+		size_t n = chunk;
+
+		if (blk + n > old_blocks)
+			n = old_blocks - blk;
+		err = ext2fs_get_block_bitmap_range2(saved, blk, n, bits);
+		if (!err)
+			err = ext2fs_set_block_bitmap_range2(nfs->block_map,
+							     blk, n, bits);
+		if (err)
+			goto fail;
+	}
+
+	*nfsp = nfs;
+	nfs = NULL;
+	goto out;
+fail:
+	ret = translate_error(fs, 0, err);
+out:
+	if (nfs) {
+		nfs->io = fs->io;
+		ext2fs_free(nfs);
+	}
+	if (saved)
+		ext2fs_free_block_bitmap(saved);
+	ext2fs_free_mem(&free_before);
+	ext2fs_free_mem(&bits);
+	if (ret)
+		ext2fs_free_mem(&lay->tables);
+	return ret;
+}
+
+static int f4r_layout_same(const struct f4r_layout *a,
+			   const struct f4r_layout *b)
+{
+	return a->new_blocks == b->new_blocks &&
+	       a->old_groups == b->old_groups &&
+	       a->new_groups == b->new_groups &&
+	       memcmp(a->tables, b->tables,
+		      3 * (a->new_groups - a->old_groups) *
+		      sizeof(*a->tables)) == 0;
+}
+
+/* Everything that rules a resize out, checked before the disk is touched. */
+static int f4r_check(struct fuse4fs *ff, ext2_filsys fs, blk64_t new_blocks,
+		     blk64_t *dev_blocks, blk64_t *journal_blocks)
+{
+	struct ext2_super_block *sb = fs->super;
+	blk64_t old_blocks = ext2fs_blocks_count(sb);
+	blk64_t groups, desc_blocks, need;
+	errcode_t err;
+	int empty;
+
+	if (!ext2fs_has_feature_journal(sb) || !sb->s_journal_inum ||
+	    ext2fs_has_feature_journal_dev(sb))
+		return f4r_refuse(ff, EOPNOTSUPP, _("no internal journal"));
+	if (!ext2fs_has_feature_resize_inode(sb))
+		return f4r_refuse(ff, EOPNOTSUPP, _("no resize_inode"));
+	if (!ext2fs_has_feature_flex_bg(sb) || !ext2fs_has_feature_64bit(sb) ||
+	    !ext2fs_has_feature_metadata_csum(sb) ||
+	    !ext2fs_has_feature_extents(sb) ||
+	    !ext2fs_has_feature_sparse_super(sb))
+		return f4r_refuse(ff, EOPNOTSUPP,
+ _("needs flex_bg, 64bit, metadata_csum, extent and sparse_super"));
+	if (ext2fs_has_feature_meta_bg(sb) || ext2fs_has_feature_bigalloc(sb) ||
+	    ext2fs_has_feature_sparse_super2(sb))
+		return f4r_refuse(ff, EOPNOTSUPP,
+ _("meta_bg, bigalloc and sparse_super2 are not supported"));
+	if (sb->s_state & EXT2_ERROR_FS)
+		return f4r_refuse(ff, EPERM, _("the file system has errors"));
+	if (ext2fs_has_feature_journal_needs_recovery(sb))
+		return f4r_refuse(ff, EOPNOTSUPP, _("the journal needs recovery"));
+	if (ext2fs_has_feature_mmp(sb) && (fs->flags & EXT2_FLAG_SKIP_MMP))
+		return f4r_refuse(ff, EOPNOTSUPP, _("MMP is not being maintained"));
+
+	if (new_blocks == old_blocks)
+		return 0;
+	if (new_blocks < old_blocks)
+		return f4r_refuse(ff, EINVAL, _("shrinking is not supported online"));
+
+	err = ext2fs_get_device_size2(ff->device_path, fs->blocksize,
+				      dev_blocks);
+	if (err)
+		return translate_error(fs, 0, err);
+	if (new_blocks > *dev_blocks)
+		return f4r_refuse(ff, EINVAL, _("the new size exceeds the device"));
+
+	/* Growing past the reserved GDT blocks needs meta_bg, i.e. offline */
+	groups = ext2fs_div64_ceil(new_blocks - sb->s_first_data_block,
+				   EXT2_BLOCKS_PER_GROUP(sb));
+	desc_blocks = ext2fs_div_ceil(groups, EXT2_DESC_PER_BLOCK(sb));
+	if (desc_blocks > fs->desc_blocks + sb->s_reserved_gdt_blocks)
+		return f4r_refuse(ff, EOPNOTSUPP,
+ _("the reserved GDT blocks are used up; use resize2fs offline"));
+
+	err = fuse4fs_journal_probe(fs, journal_blocks, &empty);
+	if (err)
+		return translate_error(fs, 0, err);
+	if (!empty)
+		return f4r_refuse(ff, EOPNOTSUPP, _("the journal is not empty"));
+
+	/*
+	 * An upper bound on the transaction: superblock, descriptors, the
+	 * reserved GDT blocks the resize inode may rewrite, a few bitmaps
+	 * and the resize inode's indirect block, plus one tag per block.
+	 */
+	need = 1 + desc_blocks + sb->s_reserved_gdt_blocks + 4;
+	need += need / (fs->blocksize / 16) + 2;
+	if (need > *journal_blocks * 3 / 4)
+		return f4r_refuse(ff, EOPNOTSUPP,
+ _("the transaction would not fit the journal; use resize2fs offline"));
+
+	return 0;
+}
+
+/* Set a flag and rewrite the primary superblock only. */
+static errcode_t f4r_write_primary_sb(ext2_filsys fs)
+{
+	int saved = fs->flags &
+		    (EXT2_FLAG_SUPER_ONLY | EXT2_FLAG_MASTER_SB_ONLY);
+	errcode_t err;
+
+	fs->flags |= EXT2_FLAG_SUPER_ONLY | EXT2_FLAG_MASTER_SB_ONLY;
+	ext2fs_mark_super_dirty(fs);
+	err = ext2fs_flush2(fs, 0);
+	fs->flags &= ~(EXT2_FLAG_SUPER_ONLY | EXT2_FLAG_MASTER_SB_ONLY);
+	fs->flags |= saved;
+	return err;
+}
+
+static int ioctl_resize_fs(struct fuse4fs *ff, const struct fuse_ctx *ctxt,
+			   struct fuse4fs_file_handle *fh EXT2FS_ATTR((unused)),
+			   const void *indata, size_t insize)
+{
+	ext2_filsys fs = ff->fs, nfs = NULL;
+	struct f4r_layout plan = { 0 }, lay = { 0 };
+	struct f4r_stash *st;
+	struct fuse4fs_journal *jh = NULL;
+	io_channel stash_io = NULL;
+	blk64_t new_blocks, old_blocks, dev_blocks = 0, dev_now = 0;
+	blk64_t journal_blocks = 0, *list = NULL;
+	const char **data = NULL;
+	__u64 arg;
+	dgrp_t g;
+	size_t i;
+	errcode_t err;
+	int ret, committed = 0;
+
+	if (insize < sizeof(arg))
+		return -EFAULT;
+	memcpy(&arg, indata, sizeof(arg));
+	new_blocks = arg;
+
+	/*
+	 * The kernel wants CAP_SYS_RESOURCE for this.  When it gives us the
+	 * caller's uid we settle for root; when it does not (an idmapped
+	 * kernel-mode mount), only a host that checked the caller itself and
+	 * said so with -o host_authorized_resize may let it through.
+	 */
+	if (fuse4fs_caller_checked_by_kernel(ff, ctxt)) {
+		if (!ff->host_authorized_resize)
+			return f4r_refuse(ff, EPERM,
+ _("the caller's identity is unknown and the host did not authorize it"));
+	} else if (!fuse4fs_is_superuser(ff, ctxt)) {
+		return f4r_refuse(ff, EPERM, _("not the superuser"));
+	}
+	if (!fuse4fs_is_writeable(ff))
+		return -EROFS;
+	if (ff->resize_in_progress)
+		return f4r_refuse(ff, EBUSY, _("another resize is in progress"));
+
+	ret = f4r_check(ff, fs, new_blocks, &dev_blocks, &journal_blocks);
+	if (ret)
+		return ret;
+	old_blocks = ext2fs_blocks_count(fs->super);
+	if (new_blocks == old_blocks)
+		return 0;
+
+	ff->resize_in_progress = 1;
+	log_printf(ff, "%s: %llu -> %llu.\n", _("online resize, blocks"),
+		   (unsigned long long)old_blocks,
+		   (unsigned long long)new_blocks);
+
+	/* First pass: where do the new groups' inode tables go? */
+	ret = f4r_layout(ff, fs, new_blocks, NULL, &nfs, &plan);
+	if (ret)
+		goto out;
+	ext2fs_free(nfs);
+	nfs = NULL;
+
+	/*
+	 * Zero them with the lock dropped: they are beyond the file system,
+	 * so no other operation can see or touch them.
+	 */
+	pthread_mutex_unlock(&ff->bfl);
+	err = 0;
+	for (g = plan.old_groups; g < plan.new_groups && !err; g++)
+		err = ext2fs_zero_blocks2(fs, plan.tables[3 * (g - plan.old_groups) + 2],
+					  fs->inode_blocks_per_group, NULL,
+					  NULL);
+	if (!err)
+		err = io_channel_flush(fs->io);
+	pthread_mutex_lock(&ff->bfl);
+	if (err) {
+		ret = translate_error(fs, 0, err);
+		goto out;
+	}
+
+	/* Second pass, under the lock: has anything moved meanwhile? */
+	fs = ff->fs;
+	if (!fuse4fs_is_writeable(ff)) {
+		ret = -EROFS;
+		goto out;
+	}
+	if (ext2fs_blocks_count(fs->super) != old_blocks) {
+		ret = f4r_refuse(ff, EAGAIN, _("the file system changed size meanwhile"));
+		goto out;
+	}
+	err = ext2fs_get_device_size2(ff->device_path, fs->blocksize, &dev_now);
+	if (err) {
+		ret = translate_error(fs, 0, err);
+		goto out;
+	}
+	if (dev_now != dev_blocks) {
+		ret = f4r_refuse(ff, EAGAIN, _("the device changed size meanwhile"));
+		goto out;
+	}
+
+	/* The disk must match memory before the copy diverges from it */
+	err = ext2fs_flush2(fs, 0);
+	if (err) {
+		ret = translate_error(fs, 0, err);
+		goto out;
+	}
+
+	err = f4r_stash_create(fs->io, fs->blocksize, old_blocks, &stash_io);
+	if (err) {
+		ret = translate_error(fs, 0, err);
+		goto out;
+	}
+	ret = f4r_layout(ff, fs, new_blocks, stash_io, &nfs, &lay);
+	if (ret)
+		goto out;
+	if (!f4r_layout_same(&plan, &lay)) {
+		ret = f4r_refuse(ff, EAGAIN, _("the layout changed between the two passes"));
+		goto out;
+	}
+
+	for (g = lay.old_groups; g < lay.new_groups; g++) {
+		ext2fs_bg_flags_set(nfs, g, EXT2_BG_INODE_ZEROED);
+		ext2fs_group_desc_csum_set(nfs, g);
+	}
+
+	err = fix_resize_inode(nfs);
+	if (err) {
+		ret = translate_error(fs, 0, err);
+		goto out;
+	}
+
+	/*
+	 * adjust_fs_info() counts a new group's tables against that group
+	 * and ext2fs_allocate_group_table() counts them against the group
+	 * they land in, which here is the same one; recount from the bitmaps
+	 * as resize2fs does.
+	 */
+	err = resize2fs_calculate_summary_stats(nfs);
+	if (err) {
+		ret = translate_error(fs, 0, err);
+		goto out;
+	}
+
+	/*
+	 * Write the new file system out through the stash: the primary
+	 * superblock and descriptors and the old groups' bitmaps stop in the
+	 * stash, the new groups' bitmaps go to the disk.  Backups come later.
+	 * The superblock goes into the journal, and home, with needs_recovery
+	 * set, as the kernel's would be: however far the writeback gets
+	 * before a crash, the next mount replays the transaction.  The flag
+	 * comes off once the journal is empty again.
+	 */
+	ext2fs_set_feature_journal_needs_recovery(nfs->super);
+	nfs->flags |= EXT2_FLAG_MASTER_SB_ONLY;
+	ext2fs_mark_super_dirty(nfs);
+	ext2fs_mark_bb_dirty(nfs);
+	ext2fs_mark_ib_dirty(nfs);
+	err = ext2fs_flush2(nfs, EXT2_FLAG_FLUSH_NO_SYNC);
+	if (err) {
+		ret = translate_error(fs, 0, err);
+		goto out;
+	}
+
+	st = stash_io->private_data;
+	qsort(st->blocks, st->nr, sizeof(*st->blocks), f4r_stash_cmp);
+	err = ext2fs_get_array(st->nr + 1, sizeof(*list), &list);
+	if (!err)
+		err = ext2fs_get_array(st->nr + 1, sizeof(*data), &data);
+	if (err) {
+		ret = translate_error(fs, 0, err);
+		goto out;
+	}
+	for (i = 0; i < st->nr; i++) {
+		list[i] = st->blocks[i].blk;
+		data[i] = st->blocks[i].data;
+	}
+
+	err = fuse4fs_journal_begin(fs, st->nr, &jh);
+	if (err == ENOSPC) {
+		ret = f4r_refuse(ff, EOPNOTSUPP,
+ _("the changed blocks do not fit the journal; use resize2fs offline"));
+		goto out;
+	} else if (err == EBUSY) {
+		ret = f4r_refuse(ff, EOPNOTSUPP, _("the journal is not empty"));
+		goto out;
+	} else if (err) {
+		ret = translate_error(fs, 0, err);
+		goto out;
+	}
+
+	/* From here on a mount replays whatever the journal holds */
+	f4r_fault("before-sb");
+	ext2fs_set_feature_journal_needs_recovery(fs->super);
+	err = f4r_write_primary_sb(fs);
+	if (err) {
+		ext2fs_clear_feature_journal_needs_recovery(fs->super);
+		ret = translate_error(fs, 0, err);
+		goto out;
+	}
+
+	f4r_fault("after-sb");
+	err = fuse4fs_journal_commit(jh, list, data, st->nr);
+	if (err) {
+		ext2fs_clear_feature_journal_needs_recovery(fs->super);
+		f4r_write_primary_sb(fs);
+		ret = translate_error(fs, 0, err);
+		goto out;
+	}
+	committed = 1;
+	f4r_fault("after-commit");
+
+	/* Write the journaled blocks home */
+	for (i = 0; i < st->nr && !err; i++) {
+		err = io_channel_write_blk64(fs->io, list[i], 1, data[i]);
+		if (i == st->nr / 2) {
+			if (!err)
+				err = io_channel_flush(fs->io);
+			f4r_fault("mid-writeback");
+		}
+	}
+	if (!err)
+		err = io_channel_flush(fs->io);
+	if (!err) {
+		err = fuse4fs_journal_finish(jh);
+		jh = NULL;
+	}
+	if (err)
+		goto fatal;
+
+	/*
+	 * The journal is empty: the superblock no longer needs recovery.
+	 * libext2fs writes only the bytes of the superblock that differ
+	 * from orig_super, which it takes to be what is on disk; what is on
+	 * disk now is the copy that just went home, i.e. nfs->super.
+	 */
+	nfs->io = fs->io;
+	io_channel_close(stash_io);
+	stash_io = NULL;
+	memcpy(nfs->orig_super, nfs->super, SUPERBLOCK_SIZE);
+	ext2fs_clear_feature_journal_needs_recovery(nfs->super);
+	err = f4r_write_primary_sb(nfs);
+	if (err)
+		goto fatal;
+
+	/* The backup superblocks and descriptors, directly */
+	nfs->flags &= ~EXT2_FLAG_MASTER_SB_ONLY;
+	ext2fs_mark_super_dirty(nfs);
+	err = ext2fs_flush2(nfs, 0);
+	if (err)
+		goto fatal;
+
+	/* Run on the grown file system from now on; drop the old handle unflushed */
+	ff->fs = nfs;
+	nfs = NULL;
+	ext2fs_free(fs);
+	fs = ff->fs;
+	log_printf(ff, "%s: %llu %s, %zu %s.\n", _("online resize done"),
+		   (unsigned long long)lay.new_blocks, _("blocks"), st->nr,
+		   _("blocks journaled"));
+	ret = 0;
+	goto out;
+
+fatal:
+	/*
+	 * The resize is committed but not completely on disk.  The memory
+	 * image cannot be trusted either way, so stop writing; the next mount
+	 * replays the journal and e2fsck finishes the job.
+	 */
+	err_printf(ff, "%s: %s\n",
+ _("online resize committed but failed to finish; unmount and run e2fsck"),
+		   error_message(err));
+	ff->opstate = F4OP_SHUTDOWN;
+	fs->flags &= ~EXT2_FLAG_RW;
+	ret = translate_error(fs, 0, err);
+out:
+	if (jh)
+		fuse4fs_journal_abort(jh);
+	if (nfs) {
+		nfs->io = ff->fs->io;
+		ext2fs_free(nfs);
+	}
+	if (stash_io)
+		io_channel_close(stash_io);
+	ext2fs_free_mem(&list);
+	ext2fs_free_mem(&data);
+	ext2fs_free_mem(&plan.tables);
+	ext2fs_free_mem(&lay.tables);
+	if (committed && ret)
+		err_printf(ff, "%s\n", _("online resize left the journal with a transaction to replay"));
+	ff->resize_in_progress = 0;
+	return ret;
+}
+
 static void op_ioctl(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
 		     unsigned int cmd,
 		     void *arg EXT2FS_ATTR((unused)),
@@ -5451,6 +6380,9 @@ static void op_ioctl(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
 #endif
 	case EXT4_IOC_SHUTDOWN:
 		ret = ioctl_shutdown(ff, ctxt, fh, indata, insize);
+		break;
+	case EXT4_IOC_RESIZE_FS:
+		ret = ioctl_resize_fs(ff, ctxt, fh, indata, insize);
 		break;
 	default:
 		dbg_printf(ff, "%s: Unknown ioctl %d\n", __func__, cmd);
@@ -5862,6 +6794,7 @@ static struct fuse_opt fuse4fs_opts[] = {
 	FUSE4FS_OPT("kernel",		kernel,			1),
 	FUSE4FS_OPT("directio",		directio,		1),
 	FUSE4FS_OPT("noexcl",		noexcl,			1),
+	FUSE4FS_OPT("host_authorized_resize", host_authorized_resize, 1),
 	FUSE4FS_OPT("acl",		acl,			1),
 	FUSE4FS_OPT("noacl",		acl,			0),
 	FUSE4FS_OPT("lockfile=%s",	lockfile,		0),
@@ -5898,6 +6831,9 @@ static int fuse4fs_opt_proc(void *data, const char *arg,
 	case FUSE_OPT_KEY_NONOPT:
 		if (!ff->device) {
 			ff->device = strdup(arg);
+			ff->device_path = realpath(arg, NULL);
+			if (!ff->device_path)
+				ff->device_path = strdup(arg);
 			return 0;
 		}
 		return 1;
@@ -5952,6 +6888,9 @@ static int fuse4fs_opt_proc(void *data, const char *arg,
 	"    -o directio            use O_DIRECT to read and write the disk\n"
 	"    -o noexcl              do not open the disk O_EXCL, for a fuseblk\n"
 	"                           connection handed over as /dev/fd/N\n"
+	"    -o host_authorized_resize  allow EXT4_IOC_RESIZE_FS from callers whose\n"
+	"                           uid the kernel withholds (idmapped kernel mode);\n"
+	"                           the host must have checked them\n"
 	"    -o cache_size=N[KMG]   use a disk cache of this size\n"
 	"    -o errors=             behavior when an error is encountered:\n"
 	"                           continue|remount-ro|panic\n"
