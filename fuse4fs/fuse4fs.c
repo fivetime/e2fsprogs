@@ -3535,8 +3535,12 @@ static int fuse4fs_chmod(struct fuse4fs *ff, fuse_req_t req, ext2_ino_t ino,
 	 * XXX: We should really check that the inode gid is not in /any/
 	 * of the user's groups, but FUSE only tells us about the primary
 	 * group.
+	 *
+	 * In kernel mode notify_change() has already stripped S_ISGID from
+	 * a caller outside the file's group (and the request may not even
+	 * carry the caller's ids), so leave the mode as the kernel sent it.
 	 */
-	if (!fuse4fs_is_superuser(ff, ctxt)) {
+	if (!ff->kernel && !fuse4fs_is_superuser(ff, ctxt)) {
 		ret = fuse4fs_in_file_group(ff, req, inode);
 		if (ret < 0)
 			return ret;
