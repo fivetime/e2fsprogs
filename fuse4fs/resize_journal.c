@@ -15,6 +15,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include "ext2fs/ext2fs.h"
 #include "ext2fs/kernel-jbd.h"
 #include "../debugfs/journal.h"
@@ -159,6 +161,18 @@ struct block_source {
 	unsigned int blocksize;
 };
 
+/* Test hook, as in fuse4fs.c: die here if FUSE4FS_RESIZE_FAULT names it. */
+static void fault(const char *point)
+{
+	const char *want = getenv("FUSE4FS_RESIZE_FAULT");
+
+	if (want && strcmp(want, point) == 0) {
+		fprintf(stderr, "FUSE4FS: resize fault injected at %s\n", point);
+		fflush(stderr);
+		_exit(1);
+	}
+}
+
 static errcode_t read_block_from_memory(void *priv, size_t idx,
 					blk64_t blk EXT2FS_ATTR((unused)),
 					void *buf)
@@ -173,12 +187,30 @@ errcode_t fuse4fs_journal_commit(struct fuse4fs_journal *jh, blk64_t *blocks,
 				 const char * const *data, size_t nr)
 {
 	struct block_source src;
+	journal_transaction_t trans;
 	errcode_t err;
 
 	src.data = data;
 	src.blocksize = jh->journal->j_blocksize;
-	err = ext2fs_journal_write(jh->journal, 0, blocks, nr,
-				   read_block_from_memory, &src, NULL, 0);
+	err = ext2fs_journal_open_trans(jh->journal, &trans,
+					ext2fs_journal_trans_blocks(jh->journal,
+								    nr, 0));
+	if (err)
+		return err;
+
+	err = ext2fs_journal_add_blocks_to_trans(&trans, blocks, nr,
+						 read_block_from_memory, &src);
+	if (err)
+		return err;
+
+	/* Descriptor and data blocks written, no commit block yet */
+	fault("mid-commit");
+
+	err = ext2fs_journal_commit_trans(&trans);
+	if (err)
+		return err;
+
+	err = ext2fs_journal_close_trans(&trans);
 	if (err)
 		return err;
 
