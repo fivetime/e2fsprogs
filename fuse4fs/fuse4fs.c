@@ -1800,6 +1800,12 @@ static inline int fuse_set_feature_flag(struct fuse_conn_info *conn,
 
 	return 0;
 }
+
+static inline void fuse_unset_feature_flag(struct fuse_conn_info *conn,
+					   uint64_t flag)
+{
+	conn->want &= ~flag;
+}
 #endif
 
 static void op_init(void *userdata, struct fuse_conn_info *conn)
@@ -1831,6 +1837,17 @@ static void op_init(void *userdata, struct fuse_conn_info *conn)
 	 */
 	if (ff->kernel)
 		fuse_set_feature_flag(conn, FUSE_CAP_ALLOW_IDMAP);
+#endif
+#ifdef FUSE_CAP_AUTO_INVAL_DATA
+	/*
+	 * Nothing but this process writes the file system, so file data can
+	 * never change behind the page cache.  With auto_inval_data, a reader
+	 * that tails a file another thread is appending to can read zeroes
+	 * for bytes whose write(2) has already returned, until the page is
+	 * dropped again (a MySQL relay log, read by its applier thread while
+	 * the receiver appends, reports corrupted events).
+	 */
+	fuse_unset_feature_flag(conn, FUSE_CAP_AUTO_INVAL_DATA);
 #endif
 	conn->time_gran = 1;
 
